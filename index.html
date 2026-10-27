@@ -207,7 +207,55 @@
     body { padding: 0; align-items: stretch; }
     .card { max-width: none; border-radius: 0; min-height: 100%; }
   }
+
+  /* ===== Mobile sizing: not too big, not too small ===== */
+  .restaurant { font-size: clamp(28px, 8.5vw, 36px); }
+  .brand-mark { height: clamp(40px, 12vw, 48px); }
+  .order-box { margin-top: clamp(18px, 4vh, 26px); padding: clamp(18px, 3.5vh, 24px) 16px clamp(16px, 3vh, 20px); }
+  .order-number { font-size: clamp(76px, 26vw, 104px); }
+  .steps { margin-top: clamp(24px, 4.5vh, 34px); }
+  .step-name { font-size: clamp(13.5px, 3.8vw, 15px); }
+  .eta { margin-top: clamp(18px, 3.5vh, 26px); font-size: clamp(15px, 4.3vw, 16.5px); }
+  .eta.ready { font-size: clamp(17px, 5vw, 19px); }
+  .btn { padding: clamp(16px, 2.6vh, 20px) 18px; font-size: clamp(17px, 5vw, 19px); }
+  .entry h2 { font-size: clamp(20px, 6vw, 24px); }
+  .entry p { font-size: clamp(14px, 4vw, 15.5px); }
+  .entry input { font-size: clamp(34px, 11vw, 44px); }
+  .entry-logo { height: clamp(84px, 24vw, 112px); }
+  @media (max-width: 420px) {
+    .card { min-height: 100vh; min-height: 100dvh;
+            padding: calc(24px + env(safe-area-inset-top)) 20px calc(20px + env(safe-area-inset-bottom)); }
+  }
+  @media (max-height: 640px) {
+    .order-number { font-size: clamp(60px, 20vw, 84px); }
+    .eta { margin-top: 14px; }
+  }
+
+  /* ===== Text motion: words rise in as they enter the screen (scrolling down or up) ===== */
+  .sr { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
+  .js .tx .w {
+    display: inline-block; opacity: 0; transform: translateY(.7em) scale(.96); filter: blur(5px);
+    transition: opacity .6s ease, transform .75s cubic-bezier(.2,.8,.2,1), filter .6s ease;
+    transition-delay: calc(var(--i, 0) * 70ms);
+  }
+  .js .tx.in .w { opacity: 1; transform: none; filter: none; }
+  .js .rvb {
+    opacity: 0; transform: translateY(28px);
+    transition: opacity .7s ease, transform .8s cubic-bezier(.2,.8,.2,1);
+  }
+  .js .rvb.above { transform: translateY(-28px); }
+  .js .rvb.in { opacity: 1; transform: none; transition-delay: var(--d, 0s); }
+  .order-number { cursor: pointer; -webkit-user-select: none; user-select: none; }
+  .order-number.pop  { animation: numpop .65s cubic-bezier(.2,.9,.3,1.25); }
+  .order-number.bump { animation: numbump .45s ease; }
+  @keyframes numpop  { 0% { transform: scale(.6); opacity: 0; filter: blur(8px); } 100% { transform: none; opacity: 1; filter: none; } }
+  @keyframes numbump { 40% { transform: scale(1.08) rotate(-2deg); } 70% { transform: scale(.97) rotate(1deg); } }
+  @media (prefers-reduced-motion: reduce) {
+    .js .tx .w, .js .rvb { opacity: 1; transform: none; filter: none; transition: none; }
+    .order-number.pop, .order-number.bump { animation: none; }
+  }
 </style>
+<script>document.documentElement.className += ' js';</script>
 </head>
 <body>
 
@@ -372,14 +420,24 @@
     o.start(start); o.stop(start + dur + 0.05);
   }
 
+  // Real bell: a fundamental plus inharmonic partials, each fading at its own speed
+  function bell(freq, start, vol) {
+    [[1, 1], [2.01, 0.5], [2.76, 0.35], [5.4, 0.18]].forEach(function (p) {
+      var o = audioCtx.createOscillator(), g = audioCtx.createGain();
+      o.type = 'sine'; o.frequency.value = freq * p[0];
+      g.gain.setValueAtTime(0.0001, start);
+      g.gain.exponentialRampToValueAtTime(vol * p[1], start + 0.008);
+      g.gain.exponentialRampToValueAtTime(0.0001, start + 1.1 / Math.sqrt(p[0]));
+      o.connect(g); g.connect(audioCtx.destination);
+      o.start(start); o.stop(start + 1.2);
+    });
+  }
+
   function ringOnce() {
     if (!audioCtx) return;
-    var t = audioCtx.currentTime;
-    // two-tone doorbell, repeated three times
-    for (var i = 0; i < 3; i++) {
-      tone(988, t + i * 0.5, 0.22);
-      tone(1319, t + i * 0.5 + 0.2, 0.28);
-    }
+    var t = audioCtx.currentTime + 0.02;
+    // ring-ring-ring, then a pause (the timer repeats it)
+    [0, 0.22, 0.44].forEach(function (d, i) { bell(i === 1 ? 1319 : 1047, t + d, 0.3); });
   }
 
   function startRinging() {
@@ -493,6 +551,68 @@
 
   if (typeof io !== 'undefined') window.initSocket();
   else window.addEventListener('load', function () { if (typeof io !== 'undefined') window.initSocket(); });
+})();
+</script>
+<script>
+/* Text motion: words rise in when they enter the screen (down or up), and replay when the text changes */
+(function () {
+  try {
+    if (matchMedia('(prefers-reduced-motion: reduce)').matches) return;
+    if (!('IntersectionObserver' in window)) { document.documentElement.className = document.documentElement.className.replace(' js', ''); return; }
+
+    var io = new IntersectionObserver(function (es) {
+      es.forEach(function (e) {
+        var el = e.target;
+        if (e.isIntersecting) { el.classList.remove('above'); el.classList.add('in'); }
+        else { el.classList.remove('in'); el.classList.toggle('above', e.boundingClientRect.top < 0); }
+      });
+    }, { threshold: 0.2 });
+
+    function split(el) {
+      var txt = el.textContent.trim();
+      if (!txt) return;
+      el.textContent = '';
+      var sr = document.createElement('span'); sr.className = 'sr'; sr.textContent = txt; el.appendChild(sr);
+      var vis = document.createElement('span'); vis.setAttribute('aria-hidden', 'true');
+      txt.split(/\s+/).forEach(function (w, i) {
+        var s = document.createElement('span'); s.className = 'w'; s.style.setProperty('--i', i); s.textContent = w;
+        vis.appendChild(s); vis.appendChild(document.createTextNode(' '));
+      });
+      el.appendChild(vis);
+    }
+
+    function replay(el) {
+      el._busy = true; split(el);
+      el.classList.remove('in'); void el.offsetWidth;
+      requestAnimationFrame(function () { requestAnimationFrame(function () { el.classList.add('in'); el._busy = false; }); });
+    }
+
+    var mo = new MutationObserver(function (ms) {
+      ms.forEach(function (m) {
+        var el = m.target;
+        if (el._busy || el.querySelector('.w')) return;
+        replay(el);   // the page changed this text (e.g. "طلبك جاهز"): animate it again
+      });
+    });
+
+    // words
+    [].forEach.call(document.querySelectorAll('#restaurantName, .order-label, .step-name, #eta, #btnText, .entry h2, .entry p'), function (el) {
+      el.classList.add('tx'); split(el); io.observe(el); mo.observe(el, { childList: true });
+    });
+
+    // blocks
+    [].forEach.call(document.querySelectorAll('.header, .order-box, .steps'), function (el, i) {
+      el.classList.add('rvb'); el.style.setProperty('--d', (i * 0.12) + 's'); io.observe(el);
+    });
+
+    // order number: pops when it changes, bounces when tapped
+    var num = document.getElementById('orderNumber');
+    new MutationObserver(function () { num.classList.remove('pop'); void num.offsetWidth; num.classList.add('pop'); })
+      .observe(num, { childList: true, characterData: true, subtree: true });
+    num.addEventListener('click', function () { num.classList.remove('bump'); void num.offsetWidth; num.classList.add('bump'); });
+  } catch (err) {
+    document.documentElement.className = document.documentElement.className.replace(' js', '');   // never leave content hidden
+  }
 })();
 </script>
 </body>

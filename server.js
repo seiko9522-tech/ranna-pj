@@ -34,13 +34,36 @@ const CASHIER_TOKEN = crypto.randomBytes(24).toString('hex');   // proves a sock
 const sha = (v) => crypto.createHash('sha256').update(String(v)).digest();
 const safeEqual = (a, b) => crypto.timingSafeEqual(sha(a), sha(b));
 
+// Brute-force guard: 8 wrong passwords from one address -> locked 10 minutes.
+// Plus a global brake: 60 wrong passwords in 10 minutes from anywhere -> everyone waits 5 minutes.
+const failLog = new Map();
+let globalFails = { n: 0, t: 0 }, globalLockUntil = 0;
+const WINDOW = 10 * 60 * 1000;
+function lockedOut(ip) {
+  const now = Date.now();
+  if (now < globalLockUntil) return true;
+  const r = failLog.get(ip);
+  return !!(r && r.n >= 8 && now - r.t < WINDOW);
+}
+function noteFail(ip) {
+  const now = Date.now();
+  const r = failLog.get(ip);
+  if (!r || now - r.t >= WINDOW) failLog.set(ip, { n: 1, t: now }); else r.n++;
+  if (now - globalFails.t >= WINDOW) globalFails = { n: 1, t: now }; else globalFails.n++;
+  if (globalFails.n >= 60) { globalLockUntil = now + 5 * 60 * 1000; globalFails = { n: 0, t: now }; console.log('[security] too many wrong passwords: logins paused 5 min'); }
+}
+const ON_RENDER = !!process.env.RENDER;   // Render sets this automatically
+const needSetup = (res) => res.status(503).send('Server is not configured: set CASHIER_PASSWORD in the hosting dashboard.');
+
 function requireCashier(req, res, next) {
-  if (!CASHIER_PASSWORD) return next();
+  if (!CASHIER_PASSWORD) return ON_RENDER ? needSetup(res) : next();   // online: never open without a password
+  if (lockedOut(req.ip)) return res.status(429).send('Too many attempts. Try again later.');
   const m = /^Basic\s+(.+)$/i.exec(req.get('authorization') || '');
   if (m) {
     const decoded = Buffer.from(m[1], 'base64').toString('utf8');
     const pass = decoded.slice(decoded.indexOf(':') + 1);
-    if (safeEqual(pass, CASHIER_PASSWORD)) return next();
+    if (safeEqual(pass, CASHIER_PASSWORD)) { failLog.delete(req.ip); return next(); }
+    noteFail(req.ip);
   }
   res.set('WWW-Authenticate', 'Basic realm="Pager", charset="UTF-8"');
   res.status(401).send('Unauthorized');
@@ -48,24 +71,46 @@ function requireCashier(req, res, next) {
 
 // POS: API key, or the cashier password
 function requirePos(req, res, next) {
-  if (!API_KEY && !CASHIER_PASSWORD) return next();
-  const key = req.get('x-api-key') || (req.get('authorization') || '').replace(/^Bearer\s+/i, '');
+  if (!API_KEY && !CASHIER_PASSWORD) return ON_RENDER ? needSetup(res) : next();
+  if (lockedOut(req.ip)) return res.status(429).send('Too many attempts. Try again later.');
+  const auth = req.get('authorization') || '';
+  const key = req.get('x-api-key') || auth.replace(/^Bearer\s+/i, '');
   if (API_KEY && key && safeEqual(key, API_KEY)) return next();
+  if (key && !/^Basic\s/i.test(auth)) noteFail(req.ip);    // wrong API key counts as a failed attempt
   requireCashier(req, res, next);
 }
 
-// at most 3 self-service numbers per phone / 10 minutes
+// at most 3 self-service numbers per phone / 10 minutes, and 40 in total (stops fake-number flooding)
 const selfLog = new Map();
+let selfAll = [];
 function selfTicketAllowed(ip) {
   const now = Date.now();
+  selfAll = selfAll.filter((t) => now - t < 10 * 60 * 1000);
+  if (selfAll.length >= 40) return false;
   const list = (selfLog.get(ip) || []).filter((t) => now - t < 10 * 60 * 1000);
   if (list.length >= 3) { selfLog.set(ip, list); return false; }
-  list.push(now); selfLog.set(ip, list);
+  list.push(now); selfLog.set(ip, list); selfAll.push(now);
   return true;
 }
+setInterval(() => {                                  // forget old records so memory never grows
+  const now = Date.now();
+  selfLog.forEach((v, k) => { if (!v.length || now - v[v.length - 1] > 10 * 60 * 1000) selfLog.delete(k); });
+  failLog.forEach((v, k) => { if (now - v.t >= WINDOW) failLog.delete(k); });
+}, 10 * 60 * 1000).unref();
 
 const app = express();
-app.set('trust proxy', true);   // behind Caddy/Nginx (HTTPS)
+app.set('trust proxy', Number(process.env.TRUST_PROXY || 1));   // trust ONE proxy hop only (Render), not the whole header chain
+app.disable('x-powered-by');
+app.use((req, res, next) => {                      // basic browser-side protections
+  res.set({
+    'X-Content-Type-Options': 'nosniff',
+    'X-Frame-Options': 'DENY',                     // nobody can embed the cashier page in another site
+    'Referrer-Policy': 'no-referrer',
+    'Strict-Transport-Security': 'max-age=15552000',
+    'Permissions-Policy': 'camera=(), microphone=(), geolocation=()',
+  });
+  next();
+});
 app.use(cors());                                  // full CORS support
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
@@ -73,6 +118,7 @@ app.use(express.urlencoded({ extended: true }));
 const server = http.createServer(app);
 const io = new Server(server, {
   cors: { origin: '*', methods: ['GET', 'POST'] },
+  maxHttpBufferSize: 1e4,        // tiny messages only (10 KB)
 });
 
 /* ------------------------------------------------------------------ *
@@ -106,6 +152,7 @@ function broadcast() {
 function addTicket(rawId) {
   const id = norm(rawId);
   if (!id || id.length > 20) return { ok: false, error: 'bad-id' };
+  if (!tickets.has(id) && tickets.size >= 500) return { ok: false, error: 'full' };
   if (/^[0-9]+$/.test(id)) counter = Math.max(counter, parseInt(id, 10));
   if (!tickets.has(id)) tickets.set(id, { id, createdAt: Date.now() });
   broadcast();
@@ -153,7 +200,41 @@ app.post('/api/v1/tickets/:id/ready', requirePos, (req, res) => {
 /* ------------------------------------------------------------------ *
  * Pages
  * ------------------------------------------------------------------ */
-app.get('/', requireCashier, (req, res) => res.type('html').send(CASHIER_HTML.replace('__TOKEN__', CASHIER_TOKEN)));
+// Hidden cashier address.
+//   CASHIER_PATH=my-secret-123  ->  cashier screen moves to /my-secret-123
+//                                   and "/" shows the marketing page (site.html next to this file).
+//   Not set                     ->  cashier stays at "/" exactly as before.
+let CASHIER_SLUG = (process.env.CASHIER_PATH || '').trim().replace(/^\/+|\/+$/g, '');
+if (CASHIER_SLUG && !/^[A-Za-z0-9_-]{6,80}$/.test(CASHIER_SLUG)) {
+  console.log('  !! CASHIER_PATH must be 6-80 chars of letters, digits, - or _  (ignored, cashier stays at "/")');
+  CASHIER_SLUG = '';
+}
+const CASHIER_ROUTE = CASHIER_SLUG ? '/' + CASHIER_SLUG : '/';
+
+app.get(CASHIER_ROUTE, requireCashier, (req, res) => {
+  res.set('X-Robots-Tag', 'noindex, nofollow');   // keep search engines away from the cashier page
+  res.set('Cache-Control', 'no-store');
+  res.type('html').send(CASHIER_HTML.replace('__TOKEN__', CASHIER_TOKEN));
+});
+
+// Typing /admin asks for the password, then forwards to the real (secret) cashier address
+app.get('/admin', requireCashier, (req, res) => res.redirect(CASHIER_ROUTE));
+
+if (CASHIER_ROUTE !== '/') {
+  // Public home page: your marketing site (site.html), or a simple placeholder until you add it
+  app.get('/', (req, res) => {
+    const file = path.join(__dirname, 'site.html');
+    if (fs.existsSync(file)) return res.sendFile(file);
+    res.type('html').send(
+      '<!DOCTYPE html><html lang="ar" dir="rtl"><head><meta charset="UTF-8">' +
+      '<meta name="viewport" content="width=device-width, initial-scale=1"><title>رنّة</title></head>' +
+      '<body style="font-family:Tahoma,Arial,sans-serif;text-align:center;padding:90px 20px;background:#fff;color:#1a1c19">' +
+      '<h1 style="font-size:44px;margin:0 0 12px">رنّة</h1>' +
+      '<p style="font-size:20px;color:#555">نظام نداء رقمي للطلبات: يهتز جوال الزبون ويرنّ عندما يصبح طلبه جاهزاً.</p>' +
+      '</body></html>'
+    );
+  });
+}
 // One-time printable QR that opens the customer pager
 function lanAddress() {
   const all = Object.values(os.networkInterfaces()).flat();
@@ -321,14 +402,15 @@ io.on('connection', (socket) => {
  * ------------------------------------------------------------------ */
 server.listen(PORT, '0.0.0.0', () => {
   console.log('\nDigital Pager is running');
-  console.log('  Cashier : http://localhost:' + PORT + '/');
+  console.log('  Cashier : http://localhost:' + PORT + CASHIER_ROUTE);
   Object.values(os.networkInterfaces()).flat().forEach((n) => {
     if (n && n.family === 'IPv4' && !n.internal) {
       console.log('  Phones  : http://' + n.address + ':' + PORT + '/pager');
     }
   });
   console.log('  QR print: http://localhost:' + PORT + '/qr');
-  if (!CASHIER_PASSWORD) console.log('  !! CASHIER_PASSWORD is not set: the cashier screen is open to everyone');
+  if (!CASHIER_PASSWORD) console.log('  !! CASHIER_PASSWORD is not set: the cashier screen is ' + (ON_RENDER ? 'LOCKED until you set it' : 'open to everyone'));
+  else if (CASHIER_PASSWORD.length < 10) console.log('  !! CASHIER_PASSWORD is short: use 12+ characters');
   if (!API_KEY) console.log('  !! API_KEY is not set: the POS endpoint is not protected by a key');
   console.log('  POS API : POST /api/v1/tickets  { "reference": "27" }\n');
 });
