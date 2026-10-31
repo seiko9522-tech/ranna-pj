@@ -217,6 +217,21 @@ app.get(CASHIER_ROUTE, requireCashier, (req, res) => {
   res.type('html').send(CASHIER_HTML.replace('__TOKEN__', CASHIER_TOKEN));
 });
 
+/* ---- Search engines (Google) ----
+ * robots.txt + sitemap.xml are generated from PUBLIC_URL. The secret cashier address is NEVER listed here. */
+const siteBase = (req) => (process.env.PUBLIC_URL ? process.env.PUBLIC_URL.replace(/\/+$/, '') : req.protocol + '://' + req.get('host'));
+app.use('/assets', express.static(path.join(__dirname, 'assets'), { maxAge: '7d' }));   // logo, favicon, share image
+app.get('/favicon.ico', (req, res) => res.redirect(301, '/assets/favicon.png'));
+app.get('/robots.txt', (req, res) => {
+  res.type('text/plain').send(
+    'User-agent: *\nAllow: /\nDisallow: /admin\nDisallow: /pager\nDisallow: /qr\nDisallow: /api/\n\nSitemap: ' + siteBase(req) + '/sitemap.xml\n');
+});
+app.get('/sitemap.xml', (req, res) => {
+  res.type('application/xml').send(
+    '<?xml version="1.0" encoding="UTF-8"?>\n<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">\n  <url><loc>' +
+    siteBase(req) + '/</loc><changefreq>weekly</changefreq><priority>1.0</priority></url>\n</urlset>\n');
+});
+
 // Typing /admin asks for the password, then forwards to the real (secret) cashier address
 app.get('/admin', requireCashier, (req, res) => res.redirect(CASHIER_ROUTE));
 
@@ -224,7 +239,13 @@ if (CASHIER_ROUTE !== '/') {
   // Public home page: your marketing site (site.html), or a simple placeholder until you add it
   app.get('/', (req, res) => {
     const file = path.join(__dirname, 'site.html');
-    if (fs.existsSync(file)) return res.sendFile(file);
+    if (fs.existsSync(file)) {
+      const gv = String(process.env.GOOGLE_VERIFICATION || '').replace(/[^A-Za-z0-9_-]/g, '');   // Search Console code (optional)
+      const page = fs.readFileSync(file, 'utf8')
+        .split('__SITE_URL__').join(siteBase(req))
+        .replace('<!--GOOGLE_VERIFY-->', gv ? '<meta name="google-site-verification" content="' + gv + '">' : '');
+      return res.type('html').send(page);
+    }
     res.type('html').send(
       '<!DOCTYPE html><html lang="ar" dir="rtl"><head><meta charset="UTF-8">' +
       '<meta name="viewport" content="width=device-width, initial-scale=1"><title>رنّة</title></head>' +
@@ -304,6 +325,7 @@ function findPagerFile() {
 }
 
 app.get(['/pager', '/index.html'], (req, res) => {
+  res.set('X-Robots-Tag', 'noindex');   // the customer page must not appear in Google
   const found = findPagerFile();
   if (!found.file) {
     console.log('[pager] no index*.html in', __dirname);
